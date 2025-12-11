@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Proxmox LXC 上の Docker で Portainer が起動しなくなったときの復旧手順</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.7;
+      margin: 0;
+      padding: 0;
+      background: #f5f5f7;
+      color: #222;
+    }
+    .container {
+      max-width: 900px;
+      margin: 40px auto;
+      padding: 24px 20px 40px;
+      background: #fff;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+      border-radius: 12px;
+    }
+    h1, h2, h3, h4 {
+      line-height: 1.3;
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 0.5em;
+    }
+    h2 {
+      font-size: 1.4rem;
+      margin-top: 2em;
+      border-left: 4px solid #007acc;
+      padding-left: 0.5em;
+    }
+    h3 {
+      font-size: 1.2rem;
+      margin-top: 1.5em;
+    }
+    p {
+      margin: 0.6em 0;
+    }
+    code {
+      font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 0.95em;
+      background: #f0f1f4;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    pre {
+      background: #111827;
+      color: #e5e7eb;
+      padding: 12px 14px;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 0.9em;
+      margin: 1em 0;
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+      border-radius: 0;
+    }
+    ul, ol {
+      padding-left: 1.4em;
+    }
+    li {
+      margin: 0.3em 0;
+    }
+    .tagline {
+      font-size: 0.95rem;
+      color: #555;
+      margin-bottom: 1.4em;
+    }
+    .note {
+      border-left: 4px solid #f59e0b;
+      background: #fffbeb;
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin: 1em 0;
+      font-size: 0.95em;
+    }
+    .strong {
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Proxmox LXC 上の Docker で<br>Portainer が起動しなくなったときの復旧手順</h1>
+    <p class="tagline">
+      Proxmox 上の LXC コンテナで Docker と Portainer を動かしている環境で、
+      <code>net.ipv4.ip_unprivileged_port_start</code> の <code>permission denied</code> にハマり、
+      Portainer が起動しなくなったケースの実録メモです。
+    </p>
+
+    <h2>1. ざっくり概要</h2>
+    <p>
+      Proxmox 上の <strong>LXC コンテナ内で Docker</strong> を動かし、その上で <strong>Portainer CE</strong> を使っていた環境で、
+      あるタイミングから Portainer が起動しなくなりました。
+    </p>
+    <p>症状は次のようなものです。</p>
+    <ul>
+      <li>Portainer コンテナが <code>Exited (126)</code> で落ちる</li>
+      <li><code>docker run hello-world</code> ですらエラーで起動しない</li>
+      <li>ログ上は Portainer 自体は起動しているように見えるが、実際にはコンテナが正常に稼働しない</li>
+    </ul>
+    <p>
+      結論としては、これは Portainer ではなく <strong>Docker ランタイム（containerd）と LXC + AppArmor の組み合わせ</strong>が原因でした。
+      Portainer のデータそのものは Docker volume <code>portainer_data</code> に残っていたため、コンテナだけ作り直すことで復旧できました。
+    </p>
+
+    <h2>2. 環境</h2>
+    <ul>
+      <li>ハイパーバイザ: Proxmox（LXC 利用）</li>
+      <li>ゲスト: LXC コンテナ（ホスト名 <code>Docker</code>）
+        <ul>
+          <li>OS: Debian 12 (bookworm)</li>
+          <li>Docker エンジン</li>
+          <li>containerd.io: <code>2.2.0-2~debian.12~bookworm</code>（問題発生時）</li>
+        </ul>
+      </li>
+      <li>コンテナ管理: Portainer CE（イメージ: <code>portainer/portainer-ce:latest</code>）</li>
+      <li>Portainer のデータ: Docker volume <code>portainer_data</code> をコンテナ内 <code>/data</code> にマウント</li>
+    </ul>
+
+    <h2>3. 最初の症状</h2>
+    <p>Portainer が起動しない状態で、コンテナ一覧を確認すると:</p>
+
+    <pre><code>docker ps -a | grep -i portainer
+
+b1c96e95bfed   portainer/portainer-ce:latest  "/portainer"  8 months ago  Exited (126) 4 days ago  portainer
+</code></pre>
+
+    <p>ログ自体は一見正常です。</p>
+
+    <pre><code>starting Portainer | version=2.27.3
+starting HTTPS server | bind_address=:9443
+starting HTTP server  | bind_address=:9000
+loading PortainerDB   | filename=portainer.db
+Reverse tunnelling enabled
+...</code></pre>
+
+    <p>
+      しかしコンテナは <code>Exited (126)</code> となっており、Portainer の UI にはアクセスできません。
+      この時点では「Portainer の設定かイメージが壊れたのでは？」と疑っていました。
+    </p>
+
+    <h2>4. 「Portainerの問題ではない」と気づいたポイント</h2>
+    <p>
+      切り分けのため、Portainer ではなく最小構成のコンテナが動くかを確認しました。
+    </p>
+
+    <pre><code>docker run --rm hello-world
+</code></pre>
+
+    <p>結果:</p>
+
+    <pre><code>docker: Error response from daemon: failed to create task for container: 
+failed to create shim task: OCI runtime create failed: runc create failed: 
+unable to start container process: error during container init: 
+open sysctl net.ipv4.ip_unprivileged_port_start file: reopen fd 8: permission denied
+
+Run 'docker run --help' for more information
+</code></pre>
+
+    <p>
+      ここで、<strong>Portainer 固有ではなく「この LXC 上で Docker コンテナが一切起動できない」状態</strong>になっていることが判明しました。
+      つまり、Portainer を直す前に、まず Docker ランタイム環境そのものを直す必要があります。
+    </p>
+
+    <h2>5. Portainer のデータ位置の確認</h2>
+    <p>
+      あとで Portainer を復旧するときに備えて、先にデータがどこにあるかを確認しておきます。
+    </p>
+
+    <pre><code>docker inspect portainer --format '{{ range .Mounts }}{{ .Name }} -&gt; {{ .Destination }}{{ printf "\n" }}{{ end }}'
+</code></pre>
+
+    <p>出力例:</p>
+
+    <pre><code>portainer_data -&gt; /data
+ -&gt; /var/run/docker.sock
+</code></pre>
+
+    <p>
+      これにより、Portainer の設定や DB は Docker volume <code>portainer_data</code> に格納されていることが分かりました。
+      コンテナが壊れても、この volume が残っていれば後で復旧が可能です。
+    </p>
+
+    <h2>6. 試したがうまくいかなかった対策</h2>
+
+    <h3>6-1. Proxmox ホスト側のアップデート</h3>
+    <p>まずは Proxmox ホスト自体を最新にしてみました。</p>
+
+    <pre><code># Proxmox ホスト側
+apt update
+apt full-upgrade
+reboot
+</code></pre>
+
+    <p>
+      再起動後、再度 LXC に入って <code>docker run --rm hello-world</code> を実行しましたが、
+      依然として同じエラーが発生しました。
+    </p>
+
+    <h3>6-2. LXC の AppArmor プロファイルを緩和</h3>
+    <p>
+      次に、LXC と AppArmor の相性問題を疑い、対象 LXC の AppArmor プロファイルを緩和する設定を追加しました。
+    </p>
+
+    <ol>
+      <li>Proxmox ホストで CTID を確認:
+        <pre><code>pct list
+
+CTID   STATUS   NAME
+100    running  Docker
+</code></pre>
+      </li>
+      <li>対象 LXC の設定ファイルを編集:
+        <pre><code># Proxmox ホスト側
+nano /etc/pve/lxc/100.conf
+</code></pre>
+        末尾などに次の 2 行を追加:
+        <pre><code>lxc.apparmor.profile: unconfined
+lxc.mount.entry: /dev/null sys/module/apparmor/parameters/enabled none bind 0 0
+</code></pre>
+      </li>
+      <li>LXC を再起動:
+        <pre><code>pct stop 100
+pct start 100
+</code></pre>
+      </li>
+      <li>LXC に入り直して再度テスト:
+        <pre><code>docker run --rm hello-world
+</code></pre>
+      </li>
+    </ol>
+
+    <p>
+      しかし、この環境ではこのワークアラウンドだけでは解決せず、依然として同じエラーが継続しました。
+    </p>
+
+    <h2>7. 根本原因：containerd.io のバージョン</h2>
+    <p>
+      ここで、問題は「Portainer」や「AppArmor 設定」ではなく、
+      <strong>containerd.io のバージョンと LXC 環境の組み合わせ</strong>である可能性が高いと判断しました。
+    </p>
+
+    <h3>7-1. containerd.io のバージョン確認</h3>
+
+    <pre><code>apt list --installed | grep containerd
+
+containerd.io/bookworm,now 2.2.0-2~debian.12~bookworm amd64 [installed]
+</code></pre>
+
+    <p>
+      続いて、利用可能なバージョン一覧を確認します。
+    </p>
+
+    <pre><code>apt-cache policy containerd.io
+</code></pre>
+
+    <p>
+      ここで、現在インストールされている <code>2.2.0-2~debian.12~bookworm</code> より古いバージョン
+      （例: <code>1.7.28-1~debian.12~bookworm</code>）が一覧に含まれていることを確認しました。
+    </p>
+
+    <h3>7-2. containerd.io のダウングレード</h3>
+
+    <p>
+      <code>apt-cache policy</code> で確認した古いバージョンにダウングレードします。
+      以下は一例です（実際には自分の環境に表示されたバージョンを使用してください）。
+    </p>
+
+    <pre><code>apt update
+apt install -y --allow-downgrades containerd.io=1.7.28-1~debian.12~bookworm
+</code></pre>
+
+    <p>
+      再び勝手に新しいバージョンに戻されないよう、hold を設定します。
+    </p>
+
+    <pre><code>apt-mark hold containerd.io
+</code></pre>
+
+    <p>その後、daemon を再起動します。</p>
+
+    <pre><code>systemctl restart containerd
+systemctl restart docker
+</code></pre>
+
+    <h3>7-3. Docker の動作確認</h3>
+
+    <pre><code>docker run --rm hello-world
+</code></pre>
+
+    <p>
+      このタイミングで、ようやく <code>Hello from Docker!</code> が表示され、
+      コンテナが正常に起動する状態へ戻りました。
+    </p>
+
+    <div class="note">
+      <span class="strong">注意:</span>
+      これはあくまで一時的な現実解であり、セキュリティフィックスを含む新しいバージョンを避ける判断になるため、
+      本番環境などでは Proxmox 側の更新や構成見直しも検討した方が安全です。
+    </div>
+
+    <h2>8. Portainer の復旧</h2>
+    <p>
+      Docker が正常動作に戻ったので、Portainer の復旧に進みました。
+    </p>
+
+    <h3>8-1. 古い Portainer コンテナの掃除</h3>
+
+    <pre><code>docker stop portainer 2&gt;/dev/null || true
+docker rm portainer 2&gt;/dev/null || true
+</code></pre>
+
+    <p>念のため、Portainer 関連のコンテナがないことを確認します。</p>
+
+    <pre><code>docker ps -a | grep -i portainer || true
+</code></pre>
+
+    <h3>8-2. Portainer データ volume の確認</h3>
+
+    <pre><code>docker volume ls | grep -i portainer
+</code></pre>
+
+    <p>
+      ここで <code>portainer_data</code> が残っていることを確認しました。
+      これが過去の Portainer の設定・DB が入っている volume です。
+    </p>
+
+    <h3>8-3. （任意）portainer_data のバックアップ</h3>
+
+    <pre><code>mkdir -p /root/backup-portainer
+
+docker run --rm \
+  -v portainer_data:/data \
+  -v /root/backup-portainer:/backup \
+  busybox sh -c 'cd / &amp;&amp; tar czf /backup/portainer_data.tgz data'
+</code></pre>
+
+    <p>
+      これで、<code>/root/backup-portainer/portainer_data.tgz</code> に Portainer データのバックアップが作成されます。
+    </p>
+
+    <h3>8-4. Portainer コンテナの再作成</h3>
+
+    <p>復旧の本番として、既存の <code>portainer_data</code> をマウントした状態で Portainer を再作成します。</p>
+
+    <pre><code>docker run -d \
+  -p 8000:8000 \
+  -p 9000:9000 \
+  -p 9443:9443 \
+  --name portainer \
+  --restart=always \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v portainer_data:/data \
+  portainer/portainer-ce:latest
+</code></pre>
+
+    <p>
+      ホスト側で 8000 / 9000 / 9443 を既に使っている場合は、左側のポートを変更しても構いません。
+      （例: <code>-p 8443:9443</code> として <code>https://&lt;ホストIP&gt;:8443</code> でアクセス）
+    </p>
+
+    <h3>8-5. Portainer の起動確認</h3>
+
+    <pre><code>docker ps | grep -i portainer
+</code></pre>
+
+    <p>
+      <code>Up XX seconds</code> になっていればコンテナは正常稼働中です。
+      併せてログも確認します。
+    </p>
+
+    <pre><code>docker logs portainer | tail
+</code></pre>
+
+    <p>
+      例:
+    </p>
+
+    <pre><code>starting Portainer
+starting HTTPS server | bind_address=:9443
+starting HTTP server  | bind_address=:9000
+loading PortainerDB   | filename=portainer.db
+...</code></pre>
+
+    <p>
+      この状態で、ブラウザから次の URL にアクセスすると Portainer の UI にアクセスできます。
+    </p>
+
+    <ul>
+      <li>HTTPS: <code>https://&lt;サーバIP&gt;:9443</code></li>
+      <li>HTTP: <code>http://&lt;サーバIP&gt;:9000</code></li>
+    </ul>
+
+    <p>
+      既存の <code>portainer_data</code> をそのままマウントしているため、以前のエンドポイント設定や Stacks などは基本的にそのまま復活しました。
+    </p>
+
+    <h2>9. まとめと学び</h2>
+    <p>今回のケースで得られたポイントを簡単にまとめます。</p>
+
+    <ul>
+      <li><strong>Portainer が動かないときは、まず Docker 自体が正常かを確認する</strong>
+        <ul>
+          <li><code>docker run --rm hello-world</code> が通るかどうかが最初のチェックポイント</li>
+        </ul>
+      </li>
+      <li>
+        LXC 上の Docker では、
+        <strong>containerd.io / runc のバージョンと LXC + AppArmor の組み合わせ</strong>によって
+        すべてのコンテナが起動に失敗することがある
+      </li>
+      <li>
+        Portainer のデータを Docker volume（<code>portainer_data</code>）に分離しておけば、
+        コンテナ本体が壊れてもデータを残したまま再作成できる
+      </li>
+      <li>
+        復旧の順番は重要:
+        <ol>
+          <li>Docker ランタイム（containerd）の正常化</li>
+          <li>壊れた Portainer コンテナの整理</li>
+          <li><code>portainer_data</code> を使った Portainer の再作成</li>
+        </ol>
+      </li>
+    </ul>
+
+    <p>
+      似た構成（Proxmox LXC 上の Docker + Portainer）で同様の症状にハマった場合、
+      本記事の手順がトラブルシュートの参考になれば幸いです。
+    </p>
+  </div>
+</body>
+</html>
